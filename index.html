@@ -685,6 +685,38 @@
   }
 
   function render(){
+    // Don't blow away the DOM while someone's actively typing a comment —
+    // that was the cause of comments vanishing mid-keystroke.
+    const active = document.activeElement;
+    if(active && active.matches && active.matches("[data-commentinput]")){
+      return;
+    }
+
+    // Preserve scroll position relative to whichever post is currently nearest
+    // the top of the viewport, so new content arriving above doesn't yank
+    // the screen to a different post out from under you.
+    let anchorId = null, beforeTop = null;
+    const postEls = document.querySelectorAll(".post[data-postid]");
+    let bestDist = Infinity;
+    postEls.forEach(el => {
+      const d = Math.abs(el.getBoundingClientRect().top - 80); // ~80px = below sticky header
+      if(d < bestDist){ bestDist = d; anchorId = el.dataset.postid; beforeTop = el.getBoundingClientRect().top; }
+    });
+
+    doRender();
+
+    if(anchorId){
+      const afterEl = document.querySelector(`.post[data-postid="${anchorId}"]`);
+      if(afterEl){
+        const afterTop = afterEl.getBoundingClientRect().top;
+        if(Math.abs(afterTop - beforeTop) > 1){
+          window.scrollBy(0, afterTop - beforeTop);
+        }
+      }
+    }
+  }
+
+  function doRender(){
     renderProfileBar();
     const feed = document.getElementById("feed");
     const list = profileHandle ? posts.filter(p => p.handle === profileHandle) : posts;
@@ -710,7 +742,7 @@
       }).join("");
       const isMine = currentUser && p.handle === currentUser.handle;
       const imgHtml = p.image_url ? `<img class="post-image" src="${escapeHtml(p.image_url)}" loading="lazy">` : "";
-      return `<div class="post">
+      return `<div class="post" data-postid="${p.id}">
         <div class="avatar" data-viewprofile="${escapeHtml(p.handle)}" style="cursor:pointer;overflow:hidden;">${avatarHtml(p.photo_url, p.avatar, 38)}</div>
         <div class="post-main">
           <div class="post-meta">
@@ -815,6 +847,13 @@
   document.getElementById("tabBoard").addEventListener("click", () => switchTab("board"));
 
   // ---------- DATA ----------
+  let lastSignature = "";
+  function dataSignature(){
+    const lastPost = posts[0] ? posts[0].id : "";
+    const lastComment = comments[comments.length-1] ? comments[comments.length-1].id : "";
+    return `${posts.length}:${reactions.length}:${comments.length}:${lastPost}:${lastComment}`;
+  }
+
   async function loadAll(notifyOnNew){
     const [{data: p, error: pe}, {data: r, error: re}, {data: c, error: ce}] = await Promise.all([
       sb.from("posts").select("*").order("created_at", {ascending:false}),
@@ -839,6 +878,11 @@
     knownPostIds = new Set(posts.map(x => x.id));
     reactions = r || [];
     comments = c || [];
+
+    const sig = dataSignature();
+    if(sig === lastSignature) return; // nothing actually changed — don't touch the DOM
+    lastSignature = sig;
+
     render();
     if(activeTab === "board") renderBoard();
   }
