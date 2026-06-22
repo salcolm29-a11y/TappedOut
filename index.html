@@ -393,6 +393,7 @@
       <button class="icon-btn" id="refreshBtn" title="Refresh now" style="font-size:13px;">🔄</button>
     </div>
     <div class="header-right">
+      <a class="icon-btn" id="tipJarBtn" href="https://buymeacoffee.com/YOUR_USERNAME_HERE" target="_blank" rel="noopener" title="Buy us a coffee" style="text-decoration:none;display:inline-flex;">☕</a>
       <button class="icon-btn" id="notifyBtn" title="Get notified">🔔</button>
       <button class="me" id="mebtn" title="Change name">
         <span class="avatar" id="meavatar">🫥</span>
@@ -404,6 +405,7 @@
   <div class="subnav">
     <button class="active" id="tabFeed">FEED</button>
     <button id="tabBoard">🏆 MOST TAPPED OUT</button>
+    <button id="tabAdmin" style="display:none;">🛠 ADMIN</button>
   </div>
 
   <div id="composerWrap" class="composer">
@@ -431,13 +433,22 @@
   </div>
 
   <div class="board" id="board" style="display:none;"></div>
+  <div class="board" id="adminPanel" style="display:none;"></div>
 </div>
 
 <div class="modal-overlay" id="joinOverlay">
-  <div class="modal">
+  <div class="modal" id="signinStep">
     <div class="big-emoji">🪫</div>
     <h2>WELCOME TO TAPPEDOUT</h2>
-    <p>The opposite of LinkedIn. Post your most uninspiring moment. No hustle culture allowed.</p>
+    <p>The opposite of LinkedIn. Post your most uninspiring moment. No hustle culture allowed. Sign in with your email — no password, just a magic link.</p>
+    <input id="signinEmail" type="email" placeholder="you@example.com" />
+    <button class="btn btn-accent" id="signinBtn">Send magic link</button>
+    <p id="signinStatus" style="margin-top:12px;font-size:12.5px;"></p>
+  </div>
+  <div class="modal" id="profileStep" style="display:none;">
+    <div class="big-emoji">🪫</div>
+    <h2>ONE MORE THING</h2>
+    <p>You're signed in. Pick a display name for the feed.</p>
     <input id="joinName" type="text" placeholder="what should we call you?" maxlength="24" />
     <label class="img-btn" style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px;cursor:pointer;">
       📷 add a profile picture (optional)
@@ -462,7 +473,7 @@
   const POST_COOLDOWN_MS = 10000;
 
   // ---------- STATE ----------
-  let currentUser = JSON.parse(localStorage.getItem("tappedout_user") || "null");
+  let currentUser = null; // populated after real auth + profile load, not from localStorage anymore
   let posts = [];
   let reactions = [];
   let lastEventAt = Date.now();
@@ -475,6 +486,7 @@
   let knownPostIds = new Set();
   let notificationsOn = localStorage.getItem("tappedout_notify") === "1";
   let comments = [];
+  let reports = [];
   let openCommentPostIds = new Set();
   let profileHandle = null; // when set, feed is filtered to just this person's posts
 
@@ -620,9 +632,42 @@
 
   async function uploadImageIfNeeded(){
     if(!pendingImageFile) return null;
-    const url = await uploadToBucket("post-images", pendingImageFile);
-    if(!url) showToast("Image upload failed — posting without it.");
-    return url;
+
+    const ext = (pendingImageFile.name.split(".").pop() || "jpg").toLowerCase();
+    const path = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    // Step 1: upload to a PRIVATE holding bucket — nothing public yet.
+    const {error: upErr} = await sb.storage.from("pending-images").upload(path, pendingImageFile);
+    if(upErr){
+      console.error(upErr);
+      showToast("Image upload failed — posting without it.");
+      return null;
+    }
+
+    // Step 2: ask the moderation function to review it before it goes live.
+    showToast("Checking image…");
+    let result;
+    try{
+      const {data, error} = await sb.functions.invoke("moderate-image", { body: { path } });
+      if(error) throw error;
+      result = data;
+    } catch(e){
+      console.error(e);
+      showToast("Couldn't verify that image — posting without it.");
+      return null;
+    }
+
+    if(!result || !result.approved){
+      const reason = result?.reason;
+      if(reason === "moderation_not_configured"){
+        showToast("Image moderation isn't set up yet, so images are disabled for now — posting without it.");
+      } else {
+        showToast("That image didn't pass review — posting without it.");
+      }
+      return null;
+    }
+
+    return result.url;
   }
 
   // ---------- RENDER: FEED ----------
@@ -716,6 +761,156 @@
     }
   }
 
+  // ---------- SHARE AS IMAGE ----------
+  function wrapCanvasText(ctx, text, maxWidth){
+    const words = text.split(/\s+/);
+    const lines = [];
+    let line = "";
+    for(const word of words){
+      const test = line ? line + " " + word : word;
+      if(ctx.measureText(test).width > maxWidth && line){
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    if(line) lines.push(line);
+    return lines;
+  }
+
+  function loadImageEl(url){
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+
+  async function shareCardForPost(postId){
+    const post = posts.find(p => p.id === postId);
+    if(!post) return;
+    showToast("Building image…");
+
+    const W = 1080, H = 1350; // a clean 4:5 card -- works for IG feed, stories, and DMs
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    // Background
+    ctx.fillStyle = "#16150F";
+    ctx.fillRect(0, 0, W, H);
+
+    // Card surface
+    const pad = 64;
+    const cardX = pad, cardY = 160, cardW = W - pad*2, cardH = H - 160 - 220;
+    ctx.fillStyle = "#FAFAF7";
+    roundRect(ctx, cardX, cardY, cardW, cardH, 28);
+    ctx.fill();
+
+    // Header wordmark
+    ctx.fillStyle = "#FAFAF7";
+    ctx.font = "700 44px monospace";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("🪫 TAPPEDOUT", pad, 100);
+
+    // Avatar
+    const avatarSize = 96;
+    const avX = cardX + 48, avY = cardY + 48;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(avX + avatarSize/2, avY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
+    ctx.closePath();
+    ctx.clip();
+    if(post.photo_url){
+      try{
+        const img = await loadImageEl(post.photo_url);
+        ctx.drawImage(img, avX, avY, avatarSize, avatarSize);
+      } catch(e){
+        ctx.fillStyle = "#E4E1D9";
+        ctx.fillRect(avX, avY, avatarSize, avatarSize);
+      }
+    } else {
+      ctx.fillStyle = "#FAFAF7";
+      ctx.fillRect(avX, avY, avatarSize, avatarSize);
+      ctx.font = "54px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(post.avatar, avX + avatarSize/2, avY + avatarSize/2 + 4);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+    }
+    ctx.restore();
+
+    // Name + handle
+    ctx.fillStyle = "#16150F";
+    ctx.font = "700 36px sans-serif";
+    ctx.fillText(post.name, avX + avatarSize + 28, avY + 40);
+    ctx.fillStyle = "#7A7868";
+    ctx.font = "28px monospace";
+    ctx.fillText(post.handle, avX + avatarSize + 28, avY + 78);
+
+    // Post content, wrapped
+    ctx.fillStyle = "#16150F";
+    ctx.font = "44px sans-serif";
+    const textMaxWidth = cardW - 96;
+    const lines = wrapCanvasText(ctx, post.content, textMaxWidth);
+    let ty = avY + avatarSize + 70;
+    for(const line of lines){
+      ctx.fillText(line, cardX + 48, ty);
+      ty += 58;
+    }
+
+    // Reaction summary
+    const counts = {};
+    reactions.filter(r => r.post_id === post.id).forEach(r => { counts[r.emoji] = (counts[r.emoji]||0)+1; });
+    const reactionLine = REACTIONS.filter(e => counts[e]).map(e => `${e} ${counts[e]}`).join("   ");
+    if(reactionLine){
+      ctx.font = "36px sans-serif";
+      ctx.fillStyle = "#16150F";
+      ctx.fillText(reactionLine, cardX + 48, cardY + cardH - 40);
+    }
+
+    // Footer tagline
+    ctx.fillStyle = "#7A7868";
+    ctx.font = "28px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("the opposite of LinkedIn — tappedout.vercel.app", W/2, H - 60);
+    ctx.textAlign = "left";
+
+    canvas.toBlob(async (blob) => {
+      if(!blob){ showToast("Couldn't build the image."); return; }
+      const file = new File([blob], "tappedout-post.png", {type:"image/png"});
+      if(navigator.canShare && navigator.canShare({files:[file]})){
+        try{
+          await navigator.share({files:[file], title:"TappedOut"});
+          return;
+        } catch(e){ /* user cancelled share sheet -- fall through to download */ }
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "tappedout-post.png";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showToast("Saved! Share it anywhere you'd like.");
+    }, "image/png");
+  }
+
+  function roundRect(ctx, x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
   function doRender(){
     renderProfileBar();
     const feed = document.getElementById("feed");
@@ -740,7 +935,8 @@
           <span>${e}</span><span class="count">${n > 0 ? n : ""}</span>
         </button>`;
       }).join("");
-      const isMine = currentUser && p.handle === currentUser.handle;
+      const isMine = currentUser && (p.user_id === currentUser.id || p.handle === currentUser.handle);
+      const canDelete = isMine || (currentUser && currentUser.is_admin);
       const imgHtml = p.image_url ? `<img class="post-image" src="${escapeHtml(p.image_url)}" loading="lazy">` : "";
       return `<div class="post" data-postid="${p.id}">
         <div class="avatar" data-viewprofile="${escapeHtml(p.handle)}" style="cursor:pointer;overflow:hidden;">${avatarHtml(p.photo_url, p.avatar, 38)}</div>
@@ -749,11 +945,12 @@
             <span class="pname" data-viewprofile="${escapeHtml(p.handle)}" style="cursor:pointer;">${escapeHtml(p.name)}</span>
             <span class="phandle" data-viewprofile="${escapeHtml(p.handle)}" style="cursor:pointer;">${escapeHtml(p.handle)}</span>
             <span class="ptime">· ${timeAgo(p.created_at)}</span>
-            ${isMine ? `<button class="del-btn" data-delpost="${p.id}">delete</button>` : ""}
+            ${canDelete ? `<button class="del-btn" data-delpost="${p.id}">delete</button>` : ""}
+            ${!isMine && currentUser ? `<button class="del-btn" style="margin-left:${canDelete?"6px":"auto"};" data-reportpost="${p.id}">report</button>` : ""}
           </div>
           <div class="post-content">${escapeHtml(p.content)}</div>
           ${imgHtml}
-          <div class="reactions">${reactHtml}</div>
+          <div class="reactions">${reactHtml}<button class="react" data-sharepost="${p.id}" title="Share as image">📤</button></div>
           ${commentsHtml(p.id)}
         </div>
       </div>`;
@@ -764,6 +961,12 @@
     });
     feed.querySelectorAll("[data-delpost]").forEach(btn => {
       btn.addEventListener("click", () => deletePost(btn.dataset.delpost));
+    });
+    feed.querySelectorAll("[data-reportpost]").forEach(btn => {
+      btn.addEventListener("click", () => reportPost(btn.dataset.reportpost));
+    });
+    feed.querySelectorAll("[data-sharepost]").forEach(btn => {
+      btn.addEventListener("click", () => shareCardForPost(btn.dataset.sharepost));
     });
     feed.querySelectorAll("[data-viewprofile]").forEach(el => {
       el.addEventListener("click", () => { profileHandle = el.dataset.viewprofile; render(); });
@@ -791,9 +994,17 @@
     const input = document.querySelector(`[data-commentinput="${postId}"]`);
     const content = input.value.trim();
     if(!content) return;
+
+    const modResult = await checkTextModeration(content);
+    if(modResult.checked && !modResult.safe){
+      showToast("That comment didn't pass review — try rephrasing.");
+      return;
+    }
+
     input.disabled = true;
     const {error} = await sb.from("comments").insert({
       post_id: postId,
+      user_id: currentUser.id,
       name: currentUser.name,
       handle: currentUser.handle,
       avatar: currentUser.avatar,
@@ -801,7 +1012,12 @@
       content,
     });
     input.disabled = false;
-    if(error){ showToast("Couldn't post comment — try again."); console.error(error); return; }
+    if(error){
+      const friendly = friendlyModerationMessage(error);
+      showToast(friendly || "Couldn't post comment — try again.");
+      if(!friendly) console.error(error);
+      return;
+    }
     openCommentPostIds.add(postId);
   }
 
@@ -838,13 +1054,90 @@
     activeTab = tab;
     document.getElementById("tabFeed").classList.toggle("active", tab === "feed");
     document.getElementById("tabBoard").classList.toggle("active", tab === "board");
+    document.getElementById("tabAdmin").classList.toggle("active", tab === "admin");
     document.getElementById("composerWrap").style.display = tab === "feed" ? "block" : "none";
     document.getElementById("feed").style.display = tab === "feed" ? "block" : "none";
     document.getElementById("board").style.display = tab === "board" ? "block" : "none";
+    document.getElementById("adminPanel").style.display = tab === "admin" ? "block" : "none";
     if(tab === "board") renderBoard();
+    if(tab === "admin") renderAdminPanel();
   }
   document.getElementById("tabFeed").addEventListener("click", () => switchTab("feed"));
   document.getElementById("tabBoard").addEventListener("click", () => switchTab("board"));
+  document.getElementById("tabAdmin").addEventListener("click", () => switchTab("admin"));
+
+  // ---------- REPORTING & ADMIN ----------
+  async function reportPost(postId){
+    if(!currentUser) return;
+    const reason = prompt("Why are you reporting this post? (optional)") || "";
+    const {error} = await sb.from("reports").insert({
+      post_id: postId,
+      reporter_id: currentUser.id,
+      reason,
+    });
+    if(error){ showToast("Couldn't file report."); console.error(error); return; }
+    showToast("Reported. Thanks for flagging it.");
+  }
+
+  async function loadReportsIfAdmin(){
+    if(!currentUser || !currentUser.is_admin) { reports = []; return; }
+    const {data, error} = await sb.from("reports").select("*").eq("status","open").order("created_at",{ascending:false});
+    if(error){ console.error(error); return; }
+    reports = data || [];
+  }
+
+  function renderAdminPanel(){
+    const panel = document.getElementById("adminPanel");
+    if(!currentUser || !currentUser.is_admin){
+      panel.innerHTML = `<div class="empty">Not an admin.</div>`;
+      return;
+    }
+    if(!reports.length){
+      panel.innerHTML = `<div class="empty"><span class="big">✅</span>No open reports. All clear.</div>`;
+      return;
+    }
+    panel.innerHTML = reports.map(r => {
+      const post = posts.find(p => p.id === r.post_id);
+      const preview = post ? `${escapeHtml(post.name)}: ${escapeHtml(post.content)}` : "(post no longer exists)";
+      return `<div class="board-item" style="align-items:flex-start;">
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:13px;margin-bottom:4px;">${preview}</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--text-dim);">reason: ${escapeHtml(r.reason || "(none given)")}</div>
+          <div style="display:flex;gap:6px;margin-top:8px;">
+            <button class="btn" style="font-size:11.5px;padding:6px 10px;" data-dismiss="${r.id}">Dismiss</button>
+            <button class="btn" style="font-size:11.5px;padding:6px 10px;" data-deletepost="${r.id}:${r.post_id}">Delete post</button>
+            <button class="btn" style="font-size:11.5px;padding:6px 10px;color:var(--accent);border-color:var(--accent);" data-banuser="${r.id}:${post ? post.user_id : ''}">Ban user</button>
+          </div>
+        </div>
+      </div>`;
+    }).join("");
+
+    panel.querySelectorAll("[data-dismiss]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        await sb.from("reports").update({status:"dismissed"}).eq("id", btn.dataset.dismiss);
+        await loadReportsIfAdmin(); renderAdminPanel();
+      });
+    });
+    panel.querySelectorAll("[data-deletepost]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const [reportId, postId] = btn.dataset.deletepost.split(":");
+        await sb.from("posts").delete().eq("id", postId);
+        await sb.from("reports").update({status:"resolved"}).eq("id", reportId);
+        await loadReportsIfAdmin(); renderAdminPanel(); loadAll(false);
+      });
+    });
+    panel.querySelectorAll("[data-banuser]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const [reportId, userId] = btn.dataset.banuser.split(":");
+        if(!userId){ showToast("No account tied to this post — can't ban (it predates accounts)."); return; }
+        if(!confirm("Ban this user? They will no longer be able to post, comment, or react.")) return;
+        await sb.from("profiles").update({banned:true}).eq("id", userId);
+        await sb.from("reports").update({status:"resolved"}).eq("id", reportId);
+        await loadReportsIfAdmin(); renderAdminPanel();
+        showToast("User banned.");
+      });
+    });
+  }
 
   // ---------- DATA ----------
   let lastSignature = "";
@@ -887,6 +1180,29 @@
     if(activeTab === "board") renderBoard();
   }
 
+  async function checkTextModeration(text){
+    // Best-effort smarter layer. If it's not deployed/configured, this just
+    // says "didn't check" and we fall back to the database keyword filter,
+    // which always applies regardless.
+    try{
+      const {data, error} = await sb.functions.invoke("moderate-text", { body: { text } });
+      if(error) return {safe: true, checked: false};
+      return data || {safe: true, checked: false};
+    } catch(e){
+      return {safe: true, checked: false};
+    }
+  }
+
+  function friendlyModerationMessage(error){
+    if(error?.message && error.message.includes("content_blocked")){
+      return "That language isn't allowed here — try rephrasing.";
+    }
+    if(error?.message && error.message.includes("rate_limited")){
+      return "Slow down — one post every 10 seconds.";
+    }
+    return null;
+  }
+
   async function submitPost(){
     const input = document.getElementById("postInput");
     const content = input.value.trim();
@@ -902,9 +1218,20 @@
     postBtn.disabled = true;
     postBtn.textContent = "Posting…";
 
+    if(content){
+      const modResult = await checkTextModeration(content);
+      if(modResult.checked && !modResult.safe){
+        postBtn.disabled = false;
+        postBtn.textContent = "Post";
+        showToast("That post didn't pass review — try rephrasing.");
+        return;
+      }
+    }
+
     const image_url = await uploadImageIfNeeded();
 
     const {error} = await sb.from("posts").insert({
+      user_id: currentUser.id,
       name: currentUser.name,
       handle: currentUser.handle,
       avatar: currentUser.avatar,
@@ -917,8 +1244,9 @@
     postBtn.textContent = "Post";
 
     if(error){
-      if(error.message && error.message.includes("rate_limited")){
-        showToast("Slow down — one post every 10 seconds.");
+      const friendly = friendlyModerationMessage(error);
+      if(friendly){
+        showToast(friendly);
       } else {
         showToast("Couldn't post — try again.");
         console.error(error);
@@ -946,7 +1274,7 @@
     if(existing){
       await sb.from("reactions").delete().eq("id", existing.id);
     } else {
-      await sb.from("reactions").insert({post_id: postId, username: currentUser.handle, emoji});
+      await sb.from("reactions").insert({post_id: postId, user_id: currentUser.id, username: currentUser.handle, emoji});
       const post = posts.find(p => p.id === postId);
       if(post && currentUser.handle !== post.handle){
         maybeNotify("Someone reacted on TappedOut", `${currentUser.name} reacted ${emoji} to ${post.name}'s post`);
@@ -996,6 +1324,7 @@
       .on("postgres_changes", {event:"*", schema:"public", table:"posts"}, () => { flashSync(); loadAll(true); })
       .on("postgres_changes", {event:"*", schema:"public", table:"reactions"}, () => { flashSync(); loadAll(false); })
       .on("postgres_changes", {event:"*", schema:"public", table:"comments"}, () => { flashSync(); loadAll(false); })
+      .on("postgres_changes", {event:"*", schema:"public", table:"reports"}, async () => { await loadReportsIfAdmin(); if(activeTab === "admin") renderAdminPanel(); })
       .subscribe(status => {
         if(status === "SUBSCRIBED"){
           document.getElementById("synctext").textContent = "live · " + new Date().toLocaleTimeString();
@@ -1015,11 +1344,39 @@
   // ---------- JOIN FLOW ----------
   function showJoin(){ document.getElementById("joinOverlay").classList.add("visible"); }
   function hideJoin(){ document.getElementById("joinOverlay").classList.remove("visible"); }
+  function showSigninStep(){
+    document.getElementById("signinStep").style.display = "block";
+    document.getElementById("profileStep").style.display = "none";
+    showJoin();
+  }
+  function showProfileStep(){
+    document.getElementById("signinStep").style.display = "none";
+    document.getElementById("profileStep").style.display = "block";
+    showJoin();
+  }
   function applyUserToHeader(){
     if(!currentUser) return;
     document.getElementById("meavatar").innerHTML = avatarHtml(currentUser.photo_url, currentUser.avatar, 18);
     document.getElementById("mename").textContent = currentUser.name;
+    document.getElementById("tabAdmin").style.display = currentUser.is_admin ? "block" : "none";
   }
+
+  document.getElementById("signinBtn").addEventListener("click", async () => {
+    const email = document.getElementById("signinEmail").value.trim();
+    if(!email) return;
+    const btn = document.getElementById("signinBtn");
+    btn.disabled = true;
+    btn.textContent = "Sending…";
+    const {error} = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } });
+    btn.disabled = false;
+    btn.textContent = "Send magic link";
+    const status = document.getElementById("signinStatus");
+    if(error){
+      status.textContent = "Couldn't send that — check the email and try again.";
+    } else {
+      status.textContent = `Check ${email} for a sign-in link. You can close this tab.`;
+    }
+  });
 
   document.getElementById("joinBtn").addEventListener("click", async () => {
     const name = document.getElementById("joinName").value.trim();
@@ -1031,19 +1388,28 @@
     if(pendingJoinPhotoFile){
       photo_url = await uploadToBucket("avatars", pendingJoinPhotoFile);
     }
-    currentUser = { name, handle: makeHandle(name), avatar: randomAvatar(), photo_url };
-    localStorage.setItem("tappedout_user", JSON.stringify(currentUser));
-    applyUserToHeader();
-    hideJoin();
+    const {data: sessionData} = await sb.auth.getSession();
+    const uid = sessionData?.session?.user?.id;
+    if(!uid){ showToast("Session expired — try signing in again."); btn.disabled=false; btn.textContent="Join the feed"; showSigninStep(); return; }
+
+    const profile = { id: uid, name, handle: makeHandle(name), avatar: randomAvatar(), photo_url };
+    const {error} = await sb.from("profiles").insert(profile);
     btn.disabled = false;
     btn.textContent = "Join the feed";
+    if(error){ showToast("Couldn't create your profile — try again."); console.error(error); return; }
+
+    currentUser = {...profile, is_admin: false, banned: false};
+    applyUserToHeader();
+    hideJoin();
     render();
   });
   document.getElementById("joinName").addEventListener("keydown", e => {
     if(e.key === "Enter") document.getElementById("joinBtn").click();
   });
 
-  document.getElementById("mebtn").addEventListener("click", showJoin);
+  document.getElementById("mebtn").addEventListener("click", () => {
+    showToast(`Signed in. To switch accounts, sign out of this browser's storage or use a different device/email.`);
+  });
 
   document.getElementById("postBtn").addEventListener("click", submitPost);
   document.getElementById("corporateBtn").addEventListener("click", async () => {
@@ -1064,20 +1430,55 @@
     if(e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitPost();
   });
 
-  // ---------- INIT ----------
-  (function init(){
-    if(currentUser){
-      applyUserToHeader();
-    } else {
-      showJoin();
+  // ---------- AUTH-DRIVEN STARTUP ----------
+  async function loadProfileAndStart(){
+    const {data: sessionData} = await sb.auth.getSession();
+    const session = sessionData?.session;
+
+    if(!session){
+      showSigninStep();
+      return;
     }
+
+    const {data: profile, error} = await sb.from("profiles").select("*").eq("id", session.user.id).maybeSingle();
+    if(error){ console.error(error); }
+
+    if(!profile){
+      // Signed in, but hasn't picked a display name yet.
+      showProfileStep();
+      return;
+    }
+
+    if(profile.banned){
+      document.body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;text-align:center;padding:20px;">
+        <div><h1>🪫</h1><p>This account has been banned from TappedOut.</p></div>
+      </div>`;
+      return;
+    }
+
+    currentUser = profile;
+    applyUserToHeader();
+    hideJoin();
+
     const urlHandle = new URLSearchParams(location.search).get("u");
     if(urlHandle) profileHandle = urlHandle;
+
     updateNotifyBtn();
     updateBattery();
+    await loadReportsIfAdmin();
     loadAll(false);
     subscribeRealtime();
-  })();
+  }
+
+  sb.auth.onAuthStateChange((event, session) => {
+    if(event === "SIGNED_IN"){
+      loadProfileAndStart();
+    }
+  });
+
+  // ---------- INIT ----------
+  loadProfileAndStart();
 </script>
+
 </body>
 </html>
