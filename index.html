@@ -1372,7 +1372,8 @@
     btn.textContent = "Send magic link";
     const status = document.getElementById("signinStatus");
     if(error){
-      status.textContent = "Couldn't send that — check the email and try again.";
+      console.error("signInWithOtp error:", error);
+      status.textContent = `Couldn't send that — ${error.message || "unknown error"} (status: ${error.status || "n/a"})`;
     } else {
       status.textContent = `Check ${email} for a sign-in link. You can close this tab.`;
     }
